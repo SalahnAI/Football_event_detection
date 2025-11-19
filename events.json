@@ -1,0 +1,46 @@
+{
+  "events": [
+    {
+      "time": "00:00:06",
+      "description": "Player id 56 dribbling with ball under close control.",
+      "replay": false,
+      "intensity": 2
+    },
+    {
+      "time": "00:00:06",
+      "description": "Player id 39 dribbling with ball under close control.",
+      "replay": false,
+      "intensity": 4
+    },
+    {
+      "time": "00:00:07",
+      "description": "Player id 15 dribbling with ball under close control.",
+      "replay": false,
+      "intensity": 4
+    },
+    {
+      "time": "00:00:09",
+      "description": "Player id 87 dribbling with ball under close control.",
+      "replay": false,
+      "intensity": 5
+    },
+    {
+      "time": "00:00:09",
+      "description": "Player id 142 dribbling with ball under close control.",
+      "replay": false,
+      "intensity": 5
+    },
+    {
+      "time": "00:00:10",
+      "description": "Player id 163 dribbling with ball under close control.",
+      "replay": false,
+      "intensity": 3
+    },
+    {
+      "time": "00:00:11",
+      "description": "Player id 169 dribbling with ball under close control.",
+      "replay": false,
+      "intensity": 1
+    }
+  ]
+}
