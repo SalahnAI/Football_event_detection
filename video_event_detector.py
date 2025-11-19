@@ -50,23 +50,23 @@ except Exception:
 # CONFIG
 # -----------------------
 CONFIG = {
-    "detector_model": "yolov8n.pt",
+    "detector_model": "old_data.pt",
     "ball_class_names": ["sports ball", "ball"],
     "player_class_names": ["person", "player"],
     "iou_tracker_threshold": 0.35,
     "max_track_lost": 8,
-    "pass_min_distance_px": 45,
-    "ball_speed_shot_thresh_px_s": 135.0,
-    "ball_speed_pass_thresh_px_s": 55.0,
-    "replay_hash_window": 14,
-    "replay_similarity_thresh": 0.88,
-    "tackle_proximity_px": 75,
-    "tackle_speed_increase_px_s": 160.0,
+    "pass_min_distance_px": 70,
+    "ball_speed_shot_thresh_px_s": 3000.0,
+    "ball_speed_pass_thresh_px_s": 3000.0,
+    "replay_hash_window": 20,
+    "replay_similarity_thresh": 0.30,
+    "tackle_proximity_px": 35,
+    "tackle_speed_increase_px_s": 1000.0,
     "corner_zone_px": 140,
     "throwin_margin_px": 8,
     "possession_smooth_alpha": 0.45,
     "min_possession_frames": 3,
-    "shot_goal_zone_frac": 0.12,
+    "shot_goal_zone_frac": 0.05,
 }
 
 # -----------------------
@@ -241,9 +241,38 @@ class EventDetector:
         self.recent_shots = deque(maxlen=40)
         self.possession = BallPossession()
         self.recent_possessions = deque(maxlen=80)
+        self.player_team = {}       # player_id -> 'A' or 'B'
+        self.team_colors = {}       # 'A' and 'B' -> mean color in BGR
+        self.color_threshold = 50.0 # color distance threshold for assignment
 
-    def update_tracks(self, tracks, frame_idx):
+    def dominant_color(self, frame, bbox):
+        x1, y1, x2, y2 = bbox
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return np.array([0,0,0], dtype=np.float32)
+        # compute mean color
+        mean_color = crop.mean(axis=(0,1))  # BGR
+        return mean_color
+
+    def update_tracks(self, tracks, frame_idx, frame):
         self.player_tracks = {tid: tr for tid, tr in tracks.items() if tr.class_name in CONFIG['player_class_names']}
+        # assign teams based on color if not done
+        for tid, tr in self.player_tracks.items():
+            if tid in self.player_team:
+                continue
+            color = self.dominant_color(frame, tr.bbox)
+            if not self.team_colors:
+                # first two players define the teams
+                self.team_colors['A'] = color
+                self.player_team[tid] = 'A'
+            elif 'B' not in self.team_colors:
+                self.team_colors['B'] = color
+                self.player_team[tid] = 'B'
+            else:
+                # assign to nearest team color
+                dist_A = np.linalg.norm(color - self.team_colors['A'])
+                dist_B = np.linalg.norm(color - self.team_colors['B'])
+                self.player_team[tid] = 'A' if dist_A < dist_B else 'B'
         ball_candidates = [tr for tr in tracks.values() if tr.class_name in CONFIG['ball_class_names'] or tr.class_name == 'sports ball']
         if ball_candidates:
             ball = min(ball_candidates, key=lambda t: bbox_area(t.bbox))
@@ -278,30 +307,39 @@ class EventDetector:
 
     def detect_events(self, frame_idx, frame, detections, replay_flag=False):
         events=[]; now_time=frame_idx/self.fps
-        if now_time - self.last_event_time < 0.5: return events
-        ball_pos = None
-        if self.ball_tracks: _, bx, by = self.ball_tracks[-1]; ball_pos=(bx,by)
-        ball_speed = self.estimate_ball_speed()
-        owner = self.possession.update(self.player_tracks, ball_pos)
-        self.recent_possessions.append((now_time, owner))
+        if now_time - self.last_event_time < 0.5: 
+            return events
 
-        # PASS detection
+        ball_speed = self.estimate_ball_speed()
+
         if len(self.ball_tracks) >= 5:
-            f_old,x_old,y_old = self.ball_tracks[-5]
-            f_new,x_new,y_new = self.ball_tracks[-1]
+            f_old, x_old, y_old = self.ball_tracks[-5]
+            f_new, x_new, y_new = self.ball_tracks[-1]
             old_owner, d1 = self.nearest_player_to_point(x_old, y_old)
             new_owner, d2 = self.nearest_player_to_point(x_new, y_new)
-            move = math.hypot(x_new-x_old, y_new-y_old)
-            # PASS if owner changes and speed moderate and displacement towards teammate
-            if old_owner is not None and new_owner is not None and old_owner != new_owner:
-                if move > CONFIG['pass_min_distance_px'] and ball_speed > CONFIG['ball_speed_pass_thresh_px_s'] and ball_speed < CONFIG['ball_speed_shot_thresh_px_s']:
-                    ev={
-                        'type':'pass','frame':frame_idx,'time_s':now_time,'from':int(old_owner),'to':int(new_owner),
-                        'description':f'Pass from {old_owner} to {new_owner}',
+
+            old_team = self.player_team.get(old_owner)
+            new_team = self.player_team.get(new_owner)
+
+            # Only count passes within the same team
+            if old_owner is not None and new_owner is not None and old_owner != new_owner and old_team == new_team:
+                move = math.hypot(x_new - x_old, y_new - y_old)
+                if move > CONFIG['pass_min_distance_px'] and ball_speed > CONFIG['ball_speed_pass_thresh_px_s']:
+                    ev = {
+                        'type':'pass',
+                        'frame':frame_idx,
+                        'time_s':now_time,
+                        'from':int(old_owner),
+                        'to':int(new_owner),
+                        'description':f'Pass from {old_owner} ({old_team}) to {new_owner}({new_team}) (speed {int(ball_speed)} px/s)',
                         'intensity': self.compute_pass_intensity(ball_speed, len(self.players_near_ball())),
                         'replay': bool(replay_flag)
                     }
-                    events.append(ev); self.last_event_time=now_time; return events
+                    events.append(ev)
+                    self.last_event_time = now_time
+                    return events
+
+
 
         # SHOT detection (priority over pass): speed threshold + direction towards goal + recent proximity to penalty area
         if ball_speed >= CONFIG['ball_speed_shot_thresh_px_s']:
@@ -478,7 +516,7 @@ def process_video(input_path, output_json, show=False, max_frames=None, ws_enabl
                 cls_name = model.names.get(int(cls_id), str(int(cls_id)))
                 detections.append({'bbox':(int(round(x1)),int(round(y1)),int(round(x2)),int(round(y2))),'class_name':cls_name,'conf':float(conf)})
         tracks = tracker.update(detections)
-        ed.update_tracks(tracks, frame_idx)
+        ed.update_tracks(tracks, frame_idx, frame)
         # replay detection: combination of pHash hamming + ORB similarity to be robust to viewpoint
         h = phash(frame)
         frame_hash_buffer.append((h, frame.copy()))
