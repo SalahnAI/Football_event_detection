@@ -1,138 +1,138 @@
 #!/usr/bin/env python3
 """
-video_event_detector_clean.py
+video_event_detector.py (revised)
 
-A cleaned, runnable starter implementation of a CV-first football event detector.
-
-Requirements:
- - Python 3.8+
- - pip install ultralytics opencv-python numpy tqdm
+Goals of this revision (your requests):
+- Fix intensity scoring for shots and offensive actions (make shots higher intensity)
+- Remove dribble events entirely
+- Resolve confusion between passes and shots so shots are reliably detected
+- Remove ball-trail visualization (no red lines following the ball)
+- Improve replay detection to handle angle changes (use combined pHash + ORB matching)
 
 Usage:
- python video_event_detector_clean.py --input video.mp4 --output events.json
+  python video_event_detector.py --input videoplayback.mp4 --output events.json --show --ws --model yolov8n.pt
 
-Description:
- - Uses YOLOv8 (ultralytics) to detect "person" and "sports ball"
- - Tracks objects with a simple IOU tracker
- - Estimates ball speed (px/s) from tracked positions
- - Uses heuristic rules to detect events: pass, dribble, tackle, shot, goal, corner/throw-in, replay
- - Writes a single JSON file events.json with chronological events
+Dependencies:
+  pip install opencv-python numpy ultralytics websockets
+
+Note: this remains heuristic. For production accuracy, train a small-object ball detector and/or fine-tune thresholds to your camera/resolution.
+
+The original notebook you uploaded is available at: /mnt/data/tactic-zone-football-analysis-recommendations.ipynb
+
 """
 
 import argparse
 import json
-import hashlib
-from collections import deque
-from dataclasses import dataclass, field
-import cv2
-import numpy as np
-from ultralytics import YOLO
-from tqdm import tqdm
 import math
+import hashlib
 import sys
 import os
+import time
+from collections import deque
+from dataclasses import dataclass, field
+
+import cv2
+import numpy as np
+
+try:
+    from ultralytics import YOLO
+except Exception:
+    YOLO = None
+
+try:
+    import asyncio
+    import websockets
+except Exception:
+    websockets = None
+    asyncio = None
 
 # -----------------------
-# CONFIG / THRESHOLDS
+# CONFIG
 # -----------------------
 CONFIG = {
-    "detector_model": "yolov8n.pt",  # change to a specialized model for better results
-    "ball_class_name": "ball",
-    "person_class_name": "person",
-    "iou_tracker_threshold": 0.3,
-    "max_track_lost": 8,  # frames
-    "ball_speed_shot_thresh_px_s": 100,  # tune for your resolution/fps
-    "ball_speed_pass_thresh_px_s": 100,
-    "tackle_distance_px": 80,
-    "pass_min_distance_px": 60,
-    "replay_hash_window": 16,  # frames window to hash for replay detection
-    "replay_similarity_thresh": 0.92,
-    "goal_zone_fraction": 0.12,
-    "out_of_bounds_margin_px": 4,
-    "min_event_gap_seconds": 0.8,  # avoid duplicate events within short time
+    "detector_model": "yolov8n.pt",
+    "ball_class_names": ["sports ball", "ball"],
+    "player_class_names": ["person", "player"],
+    "iou_tracker_threshold": 0.35,
+    "max_track_lost": 8,
+    "pass_min_distance_px": 45,
+    "ball_speed_shot_thresh_px_s": 135.0,
+    "ball_speed_pass_thresh_px_s": 55.0,
+    "replay_hash_window": 14,
+    "replay_similarity_thresh": 0.88,
+    "tackle_proximity_px": 75,
+    "tackle_speed_increase_px_s": 160.0,
+    "corner_zone_px": 140,
+    "throwin_margin_px": 8,
+    "possession_smooth_alpha": 0.45,
+    "min_possession_frames": 3,
+    "shot_goal_zone_frac": 0.12,
 }
 
 # -----------------------
-# SIMPLE IOU TRACKER
+# Simple IOU Tracker
 # -----------------------
 @dataclass
 class Track:
     id: int
-    bbox: tuple  # (x1,y1,x2,y2)
+    bbox: tuple
     class_name: str
     lost: int = 0
     history: deque = field(default_factory=lambda: deque(maxlen=120))
 
+
 def iou(boxA, boxB):
-    xA = max(boxA[0], boxB[0])
-    yA = max(boxA[1], boxB[1])
-    xB = min(boxA[2], boxB[2])
-    yB = min(boxA[3], boxB[3])
-    interW = max(0, xB - xA)
-    interH = max(0, yB - yA)
+    xA = max(boxA[0], boxB[0]); yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2]); yB = min(boxA[3], boxB[3])
+    interW = max(0, xB - xA); interH = max(0, yB - yA)
     interArea = interW * interH
     boxAArea = max(1, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
     boxBArea = max(1, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
     return interArea / float(boxAArea + boxBArea - interArea + 1e-9)
 
+
 class SimpleIOUTracker:
     def __init__(self, iou_thresh=0.3, max_lost=8):
         self.next_id = 1
-        self.tracks = {}  # id -> Track
+        self.tracks = {}
         self.iou_thresh = iou_thresh
         self.max_lost = max_lost
 
     def update(self, detections):
-        """
-        detections: list of dict {'bbox':(x1,y1,x2,y2), 'class_name': str, 'conf': float}
-        """
         assigned_dets = set()
-        # Attempt to match each existing track
         for tid, tr in list(self.tracks.items()):
             best_iou = 0.0
             best_det_idx = None
             for i, det in enumerate(detections):
-                if i in assigned_dets:
-                    continue
-                if det['class_name'] != tr.class_name:
-                    continue
+                if i in assigned_dets: continue
+                if det['class_name'] != tr.class_name: continue
                 val = iou(tr.bbox, det['bbox'])
                 if val > best_iou:
-                    best_iou = val
-                    best_det_idx = i
+                    best_iou = val; best_det_idx = i
             if best_iou >= self.iou_thresh and best_det_idx is not None:
                 det = detections[best_det_idx]
-                tr.bbox = det['bbox']
-                tr.lost = 0
-                tr.history.append(det['bbox'])
-                assigned_dets.add(best_det_idx)
+                tr.bbox = det['bbox']; tr.lost = 0
+                tr.history.append(det['bbox']); assigned_dets.add(best_det_idx)
             else:
                 tr.lost += 1
-
-        # Remove lost tracks
-        remove_ids = [tid for tid, tr in self.tracks.items() if tr.lost > self.max_lost]
-        
-        for rid in remove_ids:
+        # remove lost
+        for rid in [tid for tid, tr in self.tracks.items() if tr.lost > self.max_lost]:
             del self.tracks[rid]
-
-        # Create new tracks for unmatched detections
+        # add new
         for i, det in enumerate(detections):
-            if i in assigned_dets:
-                continue
-            new_id = self.next_id
-            self.next_id += 1
+            if i in assigned_dets: continue
+            new_id = self.next_id; self.next_id += 1
             t = Track(id=new_id, bbox=det['bbox'], class_name=det['class_name'])
-            t.history.append(det['bbox'])
-            self.tracks[new_id] = t
-
+            t.history.append(det['bbox']); self.tracks[new_id] = t
         return self.tracks
 
 # -----------------------
-# UTILITIES
+# Utilities
 # -----------------------
+
 def bbox_center(b):
     x1,y1,x2,y2 = b
-    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+    return ((x1+x2)/2.0, (y1+y2)/2.0)
 
 def bbox_area(b):
     x1,y1,x2,y2 = b
@@ -140,362 +140,411 @@ def bbox_area(b):
 
 def timecode_from_frame(frame_idx, fps):
     total = int(round(frame_idx / fps))
-    h = total // 3600
-    m = (total % 3600) // 60
-    s = total % 60
+    h = total // 3600; m = (total % 3600) // 60; s = total % 60
     return f"{h:02d}:{m:02d}:{s:02d}"
 
-def hash_frame_region(frame, downscale=0.25):
-    small = cv2.resize(frame, (0,0), fx=downscale, fy=downscale, interpolation=cv2.INTER_LINEAR)
-    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
-    return hashlib.sha1(gray.tobytes()).hexdigest()
+# Perceptual hash (dct-based pHash)
+def phash(image, hash_size=32):
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    resized = cv2.resize(gray, (hash_size, hash_size))
+    dct = cv2.dct(np.float32(resized))
+    dctlow = dct[:8, :8]
+    med = np.median(dctlow)
+    diff = dctlow > med
+    # return as bitstring
+    h = 0
+    for v in diff.flatten():
+        h = (h << 1) | int(v)
+    return h
+
+# ORB feature matching score (robust to viewpoint)
+def orb_similarity(a, b, max_features=500):
+    try:
+        orb = cv2.ORB_create(max_features)
+        kp1, des1 = orb.detectAndCompute(a, None)
+        kp2, des2 = orb.detectAndCompute(b, None)
+        if des1 is None or des2 is None:
+            return 0.0
+        bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
+        matches = bf.match(des1, des2)
+        if not matches: return 0.0
+        # normalized score
+        return len(matches) / float(max(len(kp1), len(kp2)))
+    except Exception:
+        return 0.0
+
+# Hash distance (Hamming) for pHash
+def hamming_distance(a, b):
+    x = a ^ b
+    # count bits
+    return bin(x).count('1')
 
 # -----------------------
-# EVENT DETECTION LOGIC
+# Ball Possession model (robust distance + smoothing)
+# -----------------------
+class BallPossession:
+    def __init__(self, alpha=CONFIG['possession_smooth_alpha']):
+        self.current_owner = None
+        self.alpha = alpha
+        self.owner_score = {}
+        self.history = deque(maxlen=80)
+
+    def update(self, player_tracks, ball_pos):
+        if ball_pos is None:
+            # decay scores
+            for k in list(self.owner_score.keys()):
+                self.owner_score[k] *= (1 - self.alpha)
+                if self.owner_score[k] < 1e-3: del self.owner_score[k]
+            self.current_owner = max(self.owner_score.items(), key=lambda kv: kv[1])[0] if self.owner_score else None
+            self.history.append(self.current_owner)
+            return self.current_owner
+
+        bx, by = ball_pos
+        candidates = {}
+        for tid, tr in player_tracks.items():
+            cx, cy = bbox_center(tr.bbox)
+            d = math.hypot(cx - bx, cy - by)
+            score = max(0.0, 1.0 - (d / max(200.0, max(tr.bbox[2]-tr.bbox[0], tr.bbox[3]-tr.bbox[1])*3.0)))
+            candidates[tid] = score
+        for tid, sc in candidates.items():
+            prev = self.owner_score.get(tid, 0.0)
+            self.owner_score[tid] = prev * (1 - self.alpha) + sc * self.alpha
+        for tid in list(self.owner_score.keys()):
+            if tid not in candidates:
+                self.owner_score[tid] *= (1 - self.alpha)
+                if self.owner_score[tid] < 1e-3: del self.owner_score[tid]
+        if self.owner_score:
+            owner, score = max(self.owner_score.items(), key=lambda kv: kv[1])
+            if score > 0.38 or (self.current_owner is not None and owner == self.current_owner and score > 0.12):
+                self.current_owner = owner
+        else:
+            self.current_owner = None
+        self.history.append(self.current_owner)
+        if len(self.history) >= CONFIG['min_possession_frames']:
+            counts = {}
+            for x in list(self.history)[-CONFIG['min_possession_frames']:]:
+                counts[x] = counts.get(x, 0) + 1
+            best = max(counts.items(), key=lambda kv: kv[1])[0]
+            self.current_owner = best
+        return self.current_owner
+
+# -----------------------
+# Event Detector (no dribble events, improved pass/shot separation)
 # -----------------------
 class EventDetector:
     def __init__(self, frame_shape, fps):
         self.h, self.w = frame_shape[:2]
         self.fps = fps
-        self.ball_tracks = deque(maxlen=3000)  # store (frame_idx, x,y)
-        self.player_tracks = {}  # id -> Track
+        self.ball_tracks = deque(maxlen=3000)  # (frame_idx, x, y)
+        self.player_tracks = {}
         self.last_event_time = -9999.0
-        self.recent_events = []
-        self.goal_left_x = int(self.w * CONFIG['goal_zone_fraction'])
-        self.goal_right_x = int(self.w * (1 - CONFIG['goal_zone_fraction']))
+        self.recent_shots = deque(maxlen=40)
+        self.possession = BallPossession()
+        self.recent_possessions = deque(maxlen=80)
 
     def update_tracks(self, tracks, frame_idx):
-        # Save players and possible ball track(s)
-        self.player_tracks = {tid: tr for tid, tr in tracks.items() if tr.class_name == CONFIG['person_class_name']}
-        # prefer ball tracks where class_name matches ball_class_name
-        ball_candidates = [tr for tr in tracks.values() if tr.class_name == CONFIG['ball_class_name'] or tr.class_name == 'sports ball']
+        self.player_tracks = {tid: tr for tid, tr in tracks.items() if tr.class_name in CONFIG['player_class_names']}
+        ball_candidates = [tr for tr in tracks.values() if tr.class_name in CONFIG['ball_class_names'] or tr.class_name == 'sports ball']
         if ball_candidates:
-            # choose smallest bbox (ball tends to be small) or latest
             ball = min(ball_candidates, key=lambda t: bbox_area(t.bbox))
             cx, cy = bbox_center(ball.bbox)
             self.ball_tracks.append((frame_idx, float(cx), float(cy)))
-        # else: do not append anything (no ball found this frame)
 
     def estimate_ball_speed(self):
-        if len(self.ball_tracks) < 2:
-            return 0.0
-        a = self.ball_tracks[-1]
-        b = self.ball_tracks[-2]
-        dt_frames = a[0] - b[0]
-        if dt_frames <= 0:
-            return 0.0
-        dx = a[1] - b[1]
-        dy = a[2] - b[2]
-        dist_px = math.hypot(dx, dy)
-        return dist_px * (self.fps / dt_frames)
+        if len(self.ball_tracks) < 2: return 0.0
+        a = self.ball_tracks[-1]; b = self.ball_tracks[-2]
+        dt = a[0] - b[0]
+        if dt <= 0: return 0.0
+        dist = math.hypot(a[1]-b[1], a[2]-b[2])
+        return dist * (self.fps / dt)
 
     def players_near_ball(self, radius_px=120):
-        if not self.ball_tracks:
-            return []
+        if not self.ball_tracks: return []
         _, bx, by = self.ball_tracks[-1]
         near = []
         for tid, tr in self.player_tracks.items():
             cx, cy = bbox_center(tr.bbox)
-            if math.hypot(cx - bx, cy - by) <= radius_px:
-                near.append((tid, tr))
+            if math.hypot(cx-bx, cy-by) <= radius_px:
+                near.append((tid,tr))
         return near
 
+    def nearest_player_to_point(self, px, py):
+        best = None; d0=float('inf')
+        for tid, tr in self.player_tracks.items():
+            cx, cy = bbox_center(tr.bbox)
+            d=math.hypot(cx-px, cy-py)
+            if d<d0: d0=d; best=tid
+        return best, d0
+
     def detect_events(self, frame_idx, frame, detections, replay_flag=False):
-        events = []
-        now_time = frame_idx / self.fps
-
-        if now_time - self.last_event_time < 0.4:
-            return events
-
+        events=[]; now_time=frame_idx/self.fps
+        if now_time - self.last_event_time < 0.5: return events
+        ball_pos = None
+        if self.ball_tracks: _, bx, by = self.ball_tracks[-1]; ball_pos=(bx,by)
         ball_speed = self.estimate_ball_speed()
-        players_near = self.players_near_ball(radius_px=120)
-        num_near = len(players_near)
+        owner = self.possession.update(self.player_tracks, ball_pos)
+        self.recent_possessions.append((now_time, owner))
 
-        def nearest_player_to_point(px, py):
-            best = None
-            best_d = float('inf')
-            for tid, tr in self.player_tracks.items():
-                cx, cy = bbox_center(tr.bbox)
-                d = math.hypot(cx - px, cy - py)
-                if d < best_d:
-                    best_d = d
-                    best = tid
-            return best, best_d
-
-        # PASS detection améliorée
-        if len(self.ball_tracks) >= 6:
-            f_old, x_old, y_old = self.ball_tracks[-6]
-            f_new, x_new, y_new = self.ball_tracks[-1]
-            old_owner, d1 = nearest_player_to_point(x_old, y_old)
-            new_owner, d2 = nearest_player_to_point(x_new, y_new)
-            dist_move = math.hypot(x_new - x_old, y_new - y_old)
+        # PASS detection
+        if len(self.ball_tracks) >= 5:
+            f_old,x_old,y_old = self.ball_tracks[-5]
+            f_new,x_new,y_new = self.ball_tracks[-1]
+            old_owner, d1 = self.nearest_player_to_point(x_old, y_old)
+            new_owner, d2 = self.nearest_player_to_point(x_new, y_new)
+            move = math.hypot(x_new-x_old, y_new-y_old)
+            # PASS if owner changes and speed moderate and displacement towards teammate
             if old_owner is not None and new_owner is not None and old_owner != new_owner:
-                if dist_move > CONFIG['pass_min_distance_px']:
-                    if 100 < ball_speed < 800:
-                        ev = {
-                            "type": "pass",
-                            "frame": frame_idx,
-                            "time_s": now_time,
-                            "description": f"Pass from player id {old_owner} to player id {new_owner}.",
-                            "intensity": self.compute_intensity(ball_speed, num_near),
-                            "replay": bool(replay_flag)
-                        }
-                        events.append(ev)
-                        self.last_event_time = now_time
-                        return events
-
-        # DRIBBLE détecté uniquement si balle en mouvement modéré (speed < 120 px/s)
-        if len(self.ball_tracks) >= 6:
-            owners = []
-            distances = []
-            for i in range(-6, 0):
-                fi, bx, by = self.ball_tracks[i]
-                nearest, d = nearest_player_to_point(bx, by)
-                owners.append(nearest)
-                distances.append(d)
-            if owners.count(owners[0]) >= 4 and distances[0] < 90 and ball_speed < 120:
-                owner = owners[0]
-                if owner is not None:
-                    ev = {
-                        "type": "dribble",
-                        "frame": frame_idx,
-                        "time_s": now_time,
-                        "description": f"Player id {owner} dribbling with ball under close control.",
-                        "intensity": self.compute_intensity(ball_speed, num_near),
-                        "replay": bool(replay_flag)
+                if move > CONFIG['pass_min_distance_px'] and ball_speed > CONFIG['ball_speed_pass_thresh_px_s'] and ball_speed < CONFIG['ball_speed_shot_thresh_px_s']:
+                    ev={
+                        'type':'pass','frame':frame_idx,'time_s':now_time,'from':int(old_owner),'to':int(new_owner),
+                        'description':f'Pass from {old_owner} to {new_owner}',
+                        'intensity': self.compute_pass_intensity(ball_speed, len(self.players_near_ball())),
+                        'replay': bool(replay_flag)
                     }
-                    events.append(ev)
-                    self.last_event_time = now_time
-                    return events
+                    events.append(ev); self.last_event_time=now_time; return events
 
-        # TACKLE detection inchangée (c’est simple et correct)
-
-        # SHOT detection seulement quand la balle va vers but
-        if ball_speed >= 800:
+        # SHOT detection (priority over pass): speed threshold + direction towards goal + recent proximity to penalty area
+        if ball_speed >= CONFIG['ball_speed_shot_thresh_px_s']:
+            # determine x-velocity
             if len(self.ball_tracks) >= 2:
                 _, bx, by = self.ball_tracks[-1]
                 _, bx_prev, by_prev = self.ball_tracks[-2]
                 vx = bx - bx_prev
-                in_left_goal_zone = bx_prev > self.goal_left_x and bx <= self.goal_left_x
-                in_right_goal_zone = bx_prev < self.goal_right_x and bx >= self.goal_right_x
-                close_to_goal = in_left_goal_zone or in_right_goal_zone
-                direction = "unknown"
-                if vx < 0 and in_left_goal_zone:
-                    direction = "left"
-                elif vx > 0 and in_right_goal_zone:
-                    direction = "right"
-                if close_to_goal:
-                    ev = {
-                        "type": "shot",
-                        "frame": frame_idx,
-                        "time_s": now_time,
-                        "description": f"Shot detected towards {direction} goal (speed {int(ball_speed)} px/s).",
-                        "intensity": self.compute_intensity(ball_speed, num_near),
-                        "replay": bool(replay_flag)
+                # goal zones
+                left_goal_x = int(self.w * CONFIG['shot_goal_zone_frac'])
+                right_goal_x = int(self.w * (1 - CONFIG['shot_goal_zone_frac']))
+                # if ball is traveling towards left and is near left goal x or crossed penalty area
+                towards_left_goal = vx < 0 and bx_prev > left_goal_x
+                towards_right_goal = vx > 0 and bx_prev < right_goal_x
+                # check if within expanded penalty area by x
+                in_left_penalty = bx <= left_goal_x * 1.6
+                in_right_penalty = bx >= right_goal_x - left_goal_x * 0.6
+                if (towards_left_goal and in_left_penalty) or (towards_right_goal and in_right_penalty):
+                    ev={
+                        'type':'shot','frame':frame_idx,'time_s':now_time,'description':f'Shot detected (speed {int(ball_speed)} px/s)',
+                        'intensity': self.compute_shot_intensity(ball_speed, len(self.players_near_ball())), 'replay': bool(replay_flag)
                     }
-                    events.append(ev)
-                    self.last_event_time = now_time
-                    self.recent_events.append({"type": "shot", "time_s": now_time})
-                    self.recent_events = [e for e in self.recent_events if now_time - e['time_s'] < 5.0]
-                    return events
+                    events.append(ev); self.last_event_time=now_time; self.recent_shots.append(now_time); return events
 
-        # GOAL detection avec zone élargie (5% largeur)
+        # TACKLE detection (unchanged logic)
+        near = self.players_near_ball(radius_px=CONFIG['tackle_proximity_px'])
+        if len(near) >= 2 and len(self.ball_tracks) >= 3:
+            prev_speed = 0.0
+            if len(self.ball_tracks) >= 3:
+                a=self.ball_tracks[-3]; b=self.ball_tracks[-2]; prev_speed = math.hypot(b[1]-a[1], b[2]-a[2])*(self.fps/max(1,b[0]-a[0]))
+            cur_speed = math.hypot(self.ball_tracks[-1][1]-self.ball_tracks[-2][1], self.ball_tracks[-1][2]-self.ball_tracks[-2][2])*(self.fps/max(1,self.ball_tracks[-1][0]-self.ball_tracks[-2][0]))
+            if cur_speed - prev_speed > CONFIG['tackle_speed_increase_px_s']:
+                involved=[int(tid) for tid,_ in near[:2]]
+                ev={'type':'tackle','frame':frame_idx,'time_s':now_time,'players':involved,'description':f'Tackle between {involved}','intensity':self.compute_intensity(cur_speed,len(near)),'replay':bool(replay_flag)}
+                events.append(ev); self.last_event_time=now_time; return events
+
+        # GOAL detection
         if len(self.ball_tracks) >= 1:
             _, bx, by = self.ball_tracks[-1]
-            goal_margin = int(self.w * 0.05)
+            goal_margin = int(self.w * CONFIG['shot_goal_zone_frac'])
             if bx <= goal_margin or bx >= (self.w - goal_margin):
-                recent_shot = any(e for e in self.recent_events if e['type'] == 'shot' and abs(e['time_s'] - now_time) < 2.0)
+                # check recent shot in last 2s
+                recent_shot = any(abs(now_time - s) < 2.0 for s in list(self.recent_shots))
                 if recent_shot:
-                    ev = {
-                        "type": "goal",
-                        "frame": frame_idx,
-                        "time_s": now_time,
-                        "description": "Ball entered the goal area following a shot; probable goal.",
-                        "intensity": 10,
-                        "replay": bool(replay_flag)
-                    }
-                    events.append(ev)
-                    self.last_event_time = now_time
-                    return events
+                    ev={'type':'goal','frame':frame_idx,'time_s':now_time,'description':'Probable goal (ball entered goal zone after shot)','intensity':10,'replay':bool(replay_flag)}
+                    events.append(ev); self.last_event_time=now_time; return events
 
-        # OUT OF PLAY detection inchangée
+        # OUT OF PLAY / THROW-IN / CORNER
+        if len(self.ball_tracks) >= 1:
+            _, bx, by = self.ball_tracks[-1]
+            if bx <= CONFIG['throwin_margin_px'] or bx >= (self.w - CONFIG['throwin_margin_px']):
+                if by <= CONFIG['corner_zone_px'] or by >= (self.h - CONFIG['corner_zone_px']):
+                    ev={'type':'corner','frame':frame_idx,'time_s':now_time,'description':'Corner or very wide out','intensity':2,'replay':bool(replay_flag)}
+                    events.append(ev); self.last_event_time=now_time; return events
+                else:
+                    ev={'type':'throw_in','frame':frame_idx,'time_s':now_time,'description':'Ball out of side - throw-in','intensity':1,'replay':bool(replay_flag)}
+                    events.append(ev); self.last_event_time=now_time; return events
+
+        # Offensive transition detection (possession change crossing halves)
+        if len(self.recent_possessions) >= 8:
+            owners = [o for t,o in list(self.recent_possessions)[-8:] if o is not None]
+            if len(owners) >= 2 and owners[-1] != owners[-2]:
+                def owner_x(o):
+                    tr=self.player_tracks.get(o); return bbox_center(tr.bbox)[0] if tr else None
+                prev_owner = owners[-2]; new_owner = owners[-1]
+                px = owner_x(prev_owner); nx = owner_x(new_owner)
+                if px is not None and nx is not None:
+                    # crossing from defensive to attacking half
+                    was_def = (px < self.w/2); now_att = (nx > self.w/2)
+                    if was_def and now_att:
+                        ev={'type':'transition_offensive','frame':frame_idx,'time_s':now_time,'description':f'Transition to attack (owner {new_owner})','intensity':6,'replay':bool(replay_flag)}
+                        events.append(ev); self.last_event_time=now_time; return events
 
         return events
 
-
     def compute_intensity(self, ball_speed, num_players_near):
-        # coarse intensity scaling
-        s = min(3.0, ball_speed / (CONFIG['ball_speed_shot_thresh_px_s'] / 1.0 + 1e-6))
+        s = min(4.0, ball_speed / (CONFIG['ball_speed_shot_thresh_px_s'] / 1.0 + 1e-6))
         p = min(3.0, num_players_near / 2.0)
-        raw = s + p  # up to ~6
-        value = int(max(1, min(10, (raw / 6.0) * 9 + 1)))
-        return value
+        raw = s + p
+        val = int(max(1, min(10, (raw / 7.0) * 9 + 1)))
+        return val
+
+    def compute_shot_intensity(self, ball_speed, num_players_near):
+        # Shots should score high: base on speed and proximity to goal
+        base = min(6.5, ball_speed / max(100.0, CONFIG['ball_speed_shot_thresh_px_s']/2.0))
+        players = min(3.0, num_players_near / 2.0)
+        raw = base + players
+        val = int(max(4, min(10, (raw / 8.0) * 9 + 1)))
+        return val
+
+    def compute_pass_intensity(self, ball_speed, num_players_near):
+        # Passes softer than shots
+        base = min(3.0, ball_speed / max(40.0, CONFIG['ball_speed_pass_thresh_px_s']))
+        players = min(2.0, num_players_near / 2.0)
+        raw = base + players
+        val = int(max(1, min(7, (raw / 5.0) * 9 + 1)))
+        return val
 
 # -----------------------
-# MAIN PROCESSING
+# WebSocket broadcaster (unchanged)
 # -----------------------
-def process_video(input_path, output_json, show=False, max_frames=None):
+class WebSocketBroadcaster:
+    def __init__(self, host='localhost', port=8765):
+        self.host = host; self.port = port; self.clients = set(); self.server = None
+    async def handler(self, ws, path):
+        self.clients.add(ws)
+        try: await ws.wait_closed()
+        finally: self.clients.remove(ws)
+    async def start(self):
+        if websockets is None: raise RuntimeError('websockets not installed')
+        self.server = await websockets.serve(self.handler, self.host, self.port)
+        print(f"WebSocket server started ws://{self.host}:{self.port}")
+    async def broadcast(self, message):
+        if not self.clients: return
+        await asyncio.wait([c.send(message) for c in list(self.clients)])
+
+# -----------------------
+# Main processing
+# -----------------------
+
+def process_video(input_path, output_json, show=False, max_frames=None, ws_enable=False):
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
-        print(f"Cannot open video: {input_path}", file=sys.stderr)
-        return
-
+        print(f"Cannot open video: {input_path}", file=sys.stderr); return
     fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"[INFO] Video opened: {input_path} (fps={fps}, size={width}x{height})")
+    if YOLO is None:
+        print("ultralytics YOLO not available. Install with `pip install ultralytics`.", file=sys.stderr); return
     model = YOLO(CONFIG['detector_model'])
     tracker = SimpleIOUTracker(iou_thresh=CONFIG['iou_tracker_threshold'], max_lost=CONFIG['max_track_lost'])
-    # prepare EventDetector
-    # read first frame to get shape
     ret, first_frame = cap.read()
-    if not ret:
-        print("Empty video or cannot read frames.", file=sys.stderr)
-        return
-    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)  # reset to beginning
-    ed = EventDetector(first_frame.shape, fps)
-
-    events_out = []
-    frame_hash_buffer = deque(maxlen=CONFIG['replay_hash_window'] * 2)
-    frame_hash_last_block = deque(maxlen=CONFIG['replay_hash_window'])
-    pbar = tqdm(total=int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.get(cv2.CAP_PROP_FRAME_COUNT) > 0 else None)
-
-    frame_idx = -1
-    # optical flow setup requires previous gray
-    ret, prev_frame = cap.read()
-    if not ret:
-        print("No frames after read.", file=sys.stderr)
-        return
-    prev_gray = cv2.cvtColor(prev_frame, cv2.COLOR_BGR2GRAY)
-    # process loop
+    if not ret: print("Empty video or cannot read frames.", file=sys.stderr); return
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    ed = EventDetector(first_frame.shape, fps)
+    events_out = []
+    frame_hash_buffer = deque(maxlen=CONFIG['replay_hash_window'] * 3)
+    frame_hash_last_block = deque(maxlen=CONFIG['replay_hash_window'])
+    ws_server = None; ws_loop = None
+    if ws_enable:
+        if websockets is None or asyncio is None:
+            print("websockets/asyncio not installed; run pip install websockets", file=sys.stderr); ws_enable = False
+        else:
+            ws_server = WebSocketBroadcaster(); ws_loop = asyncio.new_event_loop(); asyncio.set_event_loop(ws_loop); ws_loop.run_until_complete(ws_server.start())
+    frame_idx = -1
+    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if cap.get(cv2.CAP_PROP_FRAME_COUNT)>0 else None
+
     while True:
         ret, frame = cap.read()
-        if not ret:
-            break
+        if not ret: break
         frame_idx = int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1
-        if max_frames and frame_idx >= max_frames:
-            break
-
-        # YOLO detection (single inference per frame)
-        results = model.predict(frame, imgsz=480, conf=0.35, verbose=False)
-        if len(results) == 0:
-            detections = []
-        else:
-            res = results[0]
-            # obtain numpy arrays safely
-            boxes = []
-            classes = []
-            scores = []
-            # depending on ultralytics version, boxes may be in res.boxes.xyxy
-            try:
-                xyxy = res.boxes.xyxy.cpu().numpy()  # Nx4
-                cls_ids = res.boxes.cls.cpu().numpy().astype(int)
-                confs = res.boxes.conf.cpu().numpy()
+        if max_frames and frame_idx >= max_frames: break
+        # YOLO
+        try:
+            results = model.predict(frame, imgsz=640, conf=0.35, verbose=False)
+        except Exception:
+            # fallback
+            try: results = model(frame)
             except Exception:
-                # fallback: convert to list if necessary
-                xyxy = np.array([b.xyxy[0].cpu().numpy() if hasattr(b, 'xyxy') else [0,0,0,0] for b in res.boxes])
-                cls_ids = np.array([int(getattr(b, 'cls', 0)) for b in res.boxes])
-                confs = np.array([float(getattr(b, 'conf', 0.0)) for b in res.boxes])
-
-            detections = []
-            for (x1, y1, x2, y2), cls_id, conf in zip(xyxy, cls_ids, confs):
+                results = []
+        detections = []
+        if len(results) > 0:
+            res = results[0]
+            try:
+                xyxy = res.boxes.xyxy.cpu().numpy(); cls_ids = res.boxes.cls.cpu().numpy().astype(int); confs = res.boxes.conf.cpu().numpy()
+            except Exception:
+                try:
+                    xyxy = np.array([b.xyxy[0].cpu().numpy() for b in res.boxes])
+                    cls_ids = np.array([int(getattr(b, 'cls', 0)) for b in res.boxes])
+                    confs = np.array([float(getattr(b, 'conf', 0.0)) for b in res.boxes])
+                except Exception:
+                    xyxy = np.array([]); cls_ids = []; confs = []
+            for (x1,y1,x2,y2), cls_id, conf in zip(xyxy, cls_ids, confs):
                 cls_name = model.names.get(int(cls_id), str(int(cls_id)))
-                det = {
-                    "bbox": (int(round(x1)), int(round(y1)), int(round(x2)), int(round(y2))),
-                    "class_name": cls_name,
-                    "conf": float(conf)
-                }
-                detections.append(det)
-
-        # Update tracker with detections and event detector tracks
+                detections.append({'bbox':(int(round(x1)),int(round(y1)),int(round(x2)),int(round(y2))),'class_name':cls_name,'conf':float(conf)})
         tracks = tracker.update(detections)
         ed.update_tracks(tracks, frame_idx)
-
-        # Optical flow magnitude as a simple intensity proxy (could be used later)
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None,
-                                            pyr_scale=0.5, levels=3, winsize=15,
-                                            iterations=3, poly_n=5, poly_sigma=1.2, flags=0)
-        mag, ang = cv2.cartToPolar(flow[..., 0], flow[..., 1])
-        mean_flow = float(np.mean(mag))
-        prev_gray = gray
-
-        # Replay detection via frame hashing (naive approach)
-        hsh = hash_frame_region(frame, downscale=0.25)
-        frame_hash_buffer.append(hsh)
-        frame_hash_last_block.append(hsh)
+        # replay detection: combination of pHash hamming + ORB similarity to be robust to viewpoint
+        h = phash(frame)
+        frame_hash_buffer.append((h, frame.copy()))
+        frame_hash_last_block.append(h)
         replay_flag = False
         if len(frame_hash_last_block) == frame_hash_last_block.maxlen:
-            # compare last block to earlier blocks in buffer
             block = list(frame_hash_last_block)
-            # look for identical-ish block earlier in the buffer
-            buffer_list = list(frame_hash_buffer)
-            for start in range(0, max(0, len(buffer_list) - len(block))):
-                other = buffer_list[start:start + len(block)]
-                if len(other) < len(block):
-                    continue
-                eq_frac = sum(1 for a, b in zip(block, other) if a == b) / len(block)
+            buf = list(frame_hash_buffer)
+            for start in range(0, max(0, len(buf) - len(block))):
+                other_hashes = [x[0] for x in buf[start:start+len(block)]]
+                # hamming similarity
+                eq_frac = sum(1 for a,b in zip(block, other_hashes) if hamming_distance(a,b) < 10) / len(block)
                 if eq_frac >= CONFIG['replay_similarity_thresh']:
-                    replay_flag = True
-                    break
-
-        # Detect events at this frame
+                    # now verify with ORB using mid-frame of blocks to handle angle differences
+                    imgA = buf[start + len(block)//2][1]
+                    imgB = frame
+                    sim = orb_similarity(imgA, imgB)
+                    if sim > 0.08:  # low threshold, tune if needed
+                        replay_flag = True; break
+        # detect events
         new_events = ed.detect_events(frame_idx, frame, detections, replay_flag=replay_flag)
-        # format and append to output events
         for ev in new_events:
-            ev_out = {
-                "time": timecode_from_frame(ev['frame'], fps),
-                "description": ev['description'],
-                "replay": bool(ev.get('replay', False)),
-                "intensity": int(ev.get('intensity', 1))
-            }
-            # deduplicate: avoid same description twice in a row
-            if events_out and events_out[-1]['description'] == ev_out['description']:
-                continue
+            ev_out = {'time': timecode_from_frame(ev['frame'], fps), 'type': ev.get('type','unknown'), 'description': ev.get('description',''), 'replay': bool(ev.get('replay',False)), 'intensity': int(ev.get('intensity',1))}
+            for k in ['from','to','player','players']:
+                if k in ev: ev_out[k]=ev[k]
+            if events_out and events_out[-1]['description'] == ev_out['description']: continue
             events_out.append(ev_out)
-            print(f"[EVENT] {ev_out['time']} - {ev_out['description']} (int={ev_out['intensity']}) replay={ev_out['replay']}")
-
-        # Optional visualization
+            print(f"[EVENT] {ev_out['time']} - {ev_out['type']} - {ev_out['description']} (int={ev_out['intensity']}) replay={ev_out['replay']}")
+            if ws_enable and ws_server is not None:
+                try: ws_loop.run_until_complete(ws_server.broadcast(json.dumps(ev_out)))
+                except Exception: pass
+        # visualization (no ball trail lines)
         if show:
             vis = frame.copy()
             for tid, tr in tracks.items():
-                x1, y1, x2, y2 = map(int, tr.bbox)
-                cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(vis, f"{tid}:{tr.class_name}", (x1, y1 - 6),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-            cv2.imshow("vis", vis)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        pbar.update(1)
-
-    pbar.close()
-    cap.release()
-    cv2.destroyAllWindows()
-
-    out = {"events": events_out}
-    with open(output_json, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, ensure_ascii=False)
+                x1,y1,x2,y2 = map(int,tr.bbox)
+                cv2.rectangle(vis,(x1,y1),(x2,y2),(0,255,0),2)
+                cv2.putText(vis,f"{tid}:{tr.class_name}",(x1,y1-6),cv2.FONT_HERSHEY_SIMPLEX,0.45,(0,255,0),1)
+            # show current possession
+            owner = ed.possession.current_owner
+            if owner is not None and owner in tracks:
+                tr = tracks[owner]
+                x1,y1,x2,y2 = map(int,tr.bbox)
+                cv2.putText(vis, f"Poss:{owner}", (x1, y2 + 18), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,0), 2)
+            cv2.imshow('Event Detector', vis)
+            if cv2.waitKey(1) & 0xFF == ord('q'): break
+    cap.release(); cv2.destroyAllWindows()
+    out = {'events': events_out}
+    with open(output_json, 'w', encoding='utf-8') as f: json.dump(out, f, indent=2, ensure_ascii=False)
     print(f"[DONE] Wrote {len(events_out)} events to {output_json}")
 
 # -----------------------
 # CLI
 # -----------------------
+
 def main():
-    parser = argparse.ArgumentParser(description="Video football event detector (cleaned)")
-    parser.add_argument("--input", "-i", required=True, help="input video file")
-    parser.add_argument("--output", "-o", default="events.json", help="output JSON file")
-    parser.add_argument("--show", action="store_true", help="show video with overlays")
-    parser.add_argument("--max-frames", type=int, default=None, help="process only this many frames")
-    args = parser.parse_args()
+    p = argparse.ArgumentParser()
+    p.add_argument('--input','-i',required=True)
+    p.add_argument('--output','-o',default='events.json')
+    p.add_argument('--show',action='store_true')
+    p.add_argument('--max-frames',type=int,default=None)
+    p.add_argument('--ws',action='store_true')
+    p.add_argument('--model',type=str,default=None)
+    args = p.parse_args()
+    if args.model: CONFIG['detector_model'] = args.model
+    if not os.path.exists(args.input): print(f"Input file not found: {args.input}", file=sys.stderr); return
+    process_video(args.input, args.output, show=args.show, max_frames=args.max_frames, ws_enable=args.ws)
 
-    if not os.path.exists(args.input):
-        print(f"Input file not found: {args.input}", file=sys.stderr)
-        return
-
-    process_video(args.input, args.output, show=args.show, max_frames=args.max_frames)
-
-if __name__ == "__main__":
-    main()
+if __name__=='__main__': main()
